@@ -1,0 +1,565 @@
+import SwiftUI
+
+struct RuntimeViewport: Equatable {
+    var size: CGSize = .zero
+
+    var isLandscape: Bool {
+        size.width > size.height
+    }
+
+    static let zero = RuntimeViewport()
+}
+
+enum IOSDisplayCoordinator {
+    static func isLandscape(viewport: RuntimeViewport) -> Bool {
+        // Prefer the active UIWindowScene orientation because overlay/window geometry
+        // can temporarily lag during iOS rotation transitions.
+        if let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive }),
+           scene.interfaceOrientation != .unknown {
+            return scene.interfaceOrientation.isLandscape
+        }
+
+        if viewport.size.width > 0 && viewport.size.height > 0 {
+            return viewport.isLandscape
+        }
+
+        return UIScreen.main.bounds.width > UIScreen.main.bounds.height
+    }
+
+    // SDL の表示位置・表示制御は SDL 側を唯一の責務とする。
+}
+
+@MainActor
+private enum IOSInputCoordinator {
+    static func applyVirtualLayout(layoutStore: VirtualControllerLayoutStore, viewport: RuntimeViewport) {
+        let isLandscape = IOSDisplayCoordinator.isLandscape(viewport: viewport)
+        for button in layoutStore.buttons(isLandscape: isLandscape) {
+            let normalizedX = min(max(0.0, button.x), 1.0)
+            let normalizedY = min(max(0.0, button.y), 1.0)
+            PlayerBridge.setVirtualButtonPoint(buttonId: button.id, x: normalizedX, y: normalizedY)
+        }
+    }
+
+    static func sendButton(buttonId: String, isPressed: Bool, showMenu: () -> Void, config: ConfigManager, fastForwardAToggleActive: inout Bool) {
+        if buttonId == "menu" {
+            if !isPressed { showMenu() }
+            return
+        }
+
+        if buttonId == "fast_forward_a" && config.fastForwardMode == 1 {
+            if !isPressed {
+                if fastForwardAToggleActive {
+                    PlayerBridge.sendKeyUp(buttonId)
+                    fastForwardAToggleActive = false
+                } else {
+                    PlayerBridge.sendKeyDown(buttonId)
+                    fastForwardAToggleActive = true
+                }
+            }
+            return
+        }
+
+        if isPressed { PlayerBridge.sendKeyDown(buttonId) } else { PlayerBridge.sendKeyUp(buttonId) }
+    }
+}
+
+struct PlayerView: View {
+    let game: Game
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var showEndConfirm = false
+    @State private var showResetConfirm = false
+    @State private var showMenu = false
+    @State private var showLayoutEditor = false
+    @State private var showButtonMapping = false
+    @State private var showSettings = false
+    @State private var hasInitializedPlayer = false
+    @State private var hasProjectSecurityScopeAccess = false
+    @State private var projectSecurityScopeURL: URL?
+    @State private var fastForwardAToggleActive = false
+    @State private var runtimeViewport: RuntimeViewport = .zero
+    @State private var gameplayFrame: CGRect = .zero
+    @State private var lastSurfaceGeometryRevision: UInt32 = 0
+    @State private var relayoutScheduled = false
+    @StateObject private var layoutStore = VirtualControllerLayoutStore.shared
+    @StateObject private var buttonMappingStore = ButtonMappingStore()
+    @StateObject private var config = ConfigManager.shared
+
+    private var touchUIEnabled: Bool {
+        config.touchUI
+    }
+
+    @ViewBuilder
+    private var virtualControllerLayer: some View {
+        EmptyView()
+    }
+
+    @ViewBuilder
+    private var runtimeSceneLayer: some View {
+        // Keep SwiftUI layer transparent so the native EasyRPG render surface stays visible.
+        Color.clear
+            .ignoresSafeArea()
+
+        virtualControllerLayer
+    }
+
+    var body: some View {
+        GeometryReader { rootGeo in
+            ZStack {
+                runtimeSceneLayer
+            }
+            .onAppear {
+                runtimeViewport = RuntimeViewport(size: rootGeo.size)
+                if rootGeo.size.width > 0, rootGeo.size.height > 0 {
+                    scheduleRelayout()
+                }
+            }
+            .onChange(of: rootGeo.size) { _, newSize in
+                runtimeViewport = RuntimeViewport(size: newSize)
+                if newSize.width > 0, newSize.height > 0 {
+                    scheduleRelayout()
+                }
+            }
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        .navigationBarBackButtonHidden(true)
+        .background(Color.clear)
+        .zIndex(1000)
+        .sheet(isPresented: $showMenu) {
+            PlayerMenuSheet(
+                game: game,
+                onEditLayout: { showLayoutEditor = true },
+                onEditButtonMapping: { showButtonMapping = true },
+                onOpenSettings: { showSettings = true },
+                onReset: { showResetConfirm = true },
+                onEnd: { showEndConfirm = true }
+            )
+        }
+        .fullScreenCover(isPresented: $showLayoutEditor) {
+            NavigationStack {
+                VirtualControllerEditorView()
+            }
+            
+            .onDisappear {
+                layoutStore.load()
+            }
+        }
+        .fullScreenCover(isPresented: $showButtonMapping) {
+            NavigationStack { ButtonMappingEditorView() }
+        }
+        .fullScreenCover(isPresented: $showSettings) {
+            NavigationStack {
+                ParitySettingsRootView()
+            }
+            .onDisappear {
+                layoutStore.load()
+            }
+        }
+        .alert("ゲームをリセットしますか？", isPresented: $showResetConfirm) {
+            Button("キャンセル", role: .cancel) {}
+            Button("リセット", role: .destructive) {
+                PlayerBridge.resetGame()
+            }
+        }
+        .alert("ゲームを終了してもよろしいですか？", isPresented: $showEndConfirm) {
+            Button("いいえ", role: .cancel) {}
+            Button("はい", role: .destructive) {
+                PlayerBridge.endGame()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    dismiss()
+                }
+            }
+        }
+        .onAppear {
+            guard !hasInitializedPlayer else { return }
+            hasInitializedPlayer = true
+            AppLogger.log("PlayerView onAppear game=\(game.path)")
+            setupPlayerWithGame()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                scheduleRelayout()
+            }
+            applySettings()
+            applyPreferredOrientationMode()
+            buttonMappingStore.applyToPlayer()
+        }
+        .onDisappear {
+            AppLogger.log("PlayerView onDisappear")
+            VirtualControllerOverlayManager.shared.dismiss()
+            restoreDefaultOrientationMode()
+            releaseProjectSecurityScope()
+        }
+        .onReceive(layoutStore.$profiles) { _ in
+            applyVirtualLayoutToPlayer()
+            refreshOverlayWindow()
+        }
+        .onChange(of: buttonMappingStore.mappings) { _, _ in
+            buttonMappingStore.applyToPlayer()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .configManagerDidSaveSettings)) { _ in
+            applySettings()
+            applyPreferredOrientationMode()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            scheduleRelayout()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            VirtualControllerOverlayManager.shared.dismiss()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            scheduleRelayout()
+        }
+
+        .onChange(of: config.touchUI) { _, _ in
+            scheduleRelayout()
+            refreshOverlayWindow()
+        }
+        .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
+            let rev = PlayerBridge.surfaceGeometryRevision()
+            if rev != lastSurfaceGeometryRevision {
+                lastSurfaceGeometryRevision = rev
+                scheduleRelayout()
+            }
+        }
+    }
+
+    private func scheduleRelayout() {
+        guard !relayoutScheduled else { return }
+        relayoutScheduled = true
+        DispatchQueue.main.async {
+            relayoutScheduled = false
+            applyAndroidParityScreenPositionAndInputLayout()
+            refreshOverlayWindow()
+        }
+    }
+
+    private func refreshOverlayWindow() {
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive }) else { return }
+        guard touchUIEnabled else {
+            VirtualControllerOverlayManager.shared.dismiss()
+            return
+        }
+        VirtualControllerOverlayManager.shared.registerOnDismiss {
+            PlayerBridge.releaseAllVirtualInputs()
+        }
+        VirtualControllerOverlayManager.shared.present(
+            in: scene,
+            layoutStore: layoutStore,
+            config: config,
+            viewport: runtimeViewport,
+            gameplayFrame: gameplayFrame,
+            onDirectionInput: { direction, isPressed in
+                handleDirectionInput(direction: direction, isPressed: isPressed)
+            },
+            onButtonInput: { buttonId, isPressed in
+                handleButtonInput(buttonId: buttonId, isPressed: isPressed)
+            }
+        )
+    }
+
+    private func applyAndroidParityScreenPositionAndInputLayout() {
+        // iOS SDL 側にゲーム画面責務を完全移譲。
+        // Swift 側ではゲーム画面のサイズ/位置を変更せず、
+        // バーチャルコントローラー座標のみ同期する。
+        applyVirtualLayoutToPlayer()
+    }
+
+    private func applyPreferredOrientationMode() {
+        // Android parity: do not force runtime geometry updates here.
+        // Orientation policy is handled by app-level settings/system rotation.
+    }
+
+
+    private func restoreDefaultOrientationMode() {
+        // Android parity: no per-view geometry reset requests.
+    }
+
+    private func setupPlayerWithGame() {
+        AppLogger.log("ENTER setupPlayerWithGame")
+        let projectURL = URL(fileURLWithPath: game.path).standardizedFileURL
+        projectSecurityScopeURL = projectURL
+        hasProjectSecurityScopeAccess = projectURL.startAccessingSecurityScopedResource()
+
+        let absoluteProjectPath = projectURL.path
+        guard FileManager.default.fileExists(atPath: absoluteProjectPath) else {
+            AppLogger.log("Project path does not exist: \(absoluteProjectPath)")
+            return
+        }
+
+        let projectPath = normalizedPathForLaunch(projectURL)
+
+        AppLogger.log("setupPlayerWithGame projectPath=\(projectPath)")
+        var args: [String] = ["--project-path", projectPath]
+
+        let resolvedSavePath = resolveSavePath(projectPath: absoluteProjectPath, rawSavePath: game.savePath)
+        if let savePath = resolvedSavePath, !savePath.isEmpty {
+            args.append("--save-path")
+            args.append(pathForLaunch(fromAbsolutePath: savePath))
+        }
+
+        if let configPath = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?.path {
+            args.append("--config-path")
+            args.append(pathForLaunch(fromAbsolutePath: configPath))
+            args.append("--log-file")
+            args.append(pathForLaunch(fromAbsolutePath: "\(configPath)/easyrpg-player.log"))
+        }
+
+        if game.encoding != "auto" {
+            args.append("--encoding")
+            args.append(game.encoding)
+        }
+
+        // Launch args must be registered before runtime starts, otherwise
+        // the core can boot into the generic PC-style menu without project context.
+        // LaunchGame registers args first and starts runtime internally.
+        // This guarantees Player::Init sees --project-path on first boot.
+        PlayerBridge.launchGame(withArgs: args)
+    }
+
+    private func releaseProjectSecurityScope() {
+        AppLogger.log("ENTER releaseProjectSecurityScope")
+        guard hasProjectSecurityScopeAccess, let scopeURL = projectSecurityScopeURL else {
+            projectSecurityScopeURL = nil
+            return
+        }
+
+        scopeURL.stopAccessingSecurityScopedResource()
+        hasProjectSecurityScopeAccess = false
+        projectSecurityScopeURL = nil
+    }
+
+
+    private func normalizedPathForLaunch(_ url: URL) -> String {
+        pathForLaunch(fromAbsolutePath: url.standardizedFileURL.path)
+    }
+
+    private func pathForLaunch(fromAbsolutePath absolutePath: String) -> String {
+        let standardized = URL(fileURLWithPath: absolutePath).standardizedFileURL.path
+        let homePath = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path
+
+        // Match in-engine fallback browser behavior: prefer sandbox-home-relative paths
+        // when launching content inside the app container. This avoids environment-
+        // specific absolute prefixes (e.g. LiveContainer mount differences).
+        if standardized == homePath {
+            return "."
+        }
+
+        if standardized.hasPrefix(homePath + "/") {
+            return String(standardized.dropFirst(homePath.count + 1))
+        }
+
+        // Keep absolute paths for locations outside the app home.
+        return standardized
+    }
+
+    private func resolveSavePath(projectPath: String, rawSavePath: String) -> String? {
+        AppLogger.log("ENTER resolveSavePath")
+        guard !rawSavePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let savePathURL: URL
+        if rawSavePath.hasPrefix("/") {
+            savePathURL = URL(fileURLWithPath: rawSavePath)
+        } else {
+            savePathURL = URL(fileURLWithPath: projectPath).appendingPathComponent(rawSavePath)
+        }
+
+        return savePathURL.standardizedFileURL.path
+    }
+
+    private func applySettings() {
+        AppLogger.log("ENTER applySettings")
+        // SDL の表示/回転/解像度の「即時制御」は Swift 側から行わない。
+        // ただし、設定値の保存（Config書き込み）は許可する。
+        PlayerBridge.setConfigBool(section: "Video", key: "Fullscreen", value: config.fullscreen)
+        PlayerBridge.setConfigBool(section: "Video", key: "ForceLandscape", value: config.forcedLandscape)
+        PlayerBridge.setConfigBool(section: "Video", key: "Stretch", value: config.stretch)
+        PlayerBridge.setConfigInt(section: "Video", key: "ScalingMode", value: config.scaleMode)
+        PlayerBridge.setConfigInt(section: "Video", key: "GameResolution", value: config.gameResolution)
+        PlayerBridge.setConfigInt(section: "Video", key: "GameBrowserLabelMode", value: config.gameBrowserLabelMode)
+
+        PlayerBridge.setMusicVolume(config.musicVolume)
+        PlayerBridge.setSoundVolume(config.soundVolume)
+        PlayerBridge.setConfigInt(section: "Audio", key: "MusicVolume", value: config.musicVolume)
+        PlayerBridge.setConfigInt(section: "Audio", key: "SoundVolume", value: config.soundVolume)
+        PlayerBridge.setConfigBool(section: "Audio", key: "Fluidsynth", value: config.fluidsynthMidi)
+        PlayerBridge.setConfigBool(section: "Audio", key: "WildMidi", value: config.wildMidi)
+        PlayerBridge.setConfigBool(section: "Audio", key: "NativeMidi", value: config.nativeMidi)
+        if let soundFont = config.selectedSoundFont {
+            PlayerBridge.setSoundFont(pathForLaunch(fromAbsolutePath: soundFont.path))
+            PlayerBridge.setConfigString(section: "Audio", key: "SoundFont", value: pathForLaunch(fromAbsolutePath: soundFont.path))
+            PlayerBridge.setConfigString(section: "Audio", key: "Soundfont", value: pathForLaunch(fromAbsolutePath: soundFont.path))
+        } else {
+            PlayerBridge.setSoundFont("")
+            PlayerBridge.setConfigString(section: "Audio", key: "SoundFont", value: "")
+            PlayerBridge.setConfigString(section: "Audio", key: "Soundfont", value: "")
+        }
+
+        PlayerBridge.setLayoutTransparency(Double(config.layoutTransparency))
+        PlayerBridge.setLayoutSize(Double(config.layoutSize))
+        PlayerBridge.setVibrationEnabled(config.enableVibration)
+        PlayerBridge.setVibrateWhenSlidingEnabled(config.vibrateWhenSliding)
+        PlayerBridge.setConfigBool(section: "Input", key: "Vibration", value: config.enableVibration)
+        PlayerBridge.setConfigBool(section: "Input", key: "VibrateWhenSliding", value: config.vibrateWhenSliding)
+        PlayerBridge.setConfigBool(section: "Input", key: "ShowABasZX", value: config.showABasZX)
+        PlayerBridge.setConfigBool(section: "Input", key: "GamepadSwapAnalog", value: config.gamepadSwapAnalog)
+        PlayerBridge.setConfigBool(section: "Input", key: "GamepadSwapDpad", value: config.gamepadSwapDpad)
+        PlayerBridge.setConfigBool(section: "Input", key: "GamepadSwapAbxy", value: config.gamepadSwapAbxy)
+        PlayerBridge.setConfigInt(section: "Input", key: "FastForwardMode", value: config.fastForwardMode)
+        PlayerBridge.setConfigInt(section: "Input", key: "LayoutTransparency", value: config.layoutTransparency)
+        PlayerBridge.setConfigInt(section: "Input", key: "LayoutSize", value: config.layoutSize)
+        PlayerBridge.setConfigBool(section: "Input", key: "IgnoreLayoutSize", value: config.ignoreLayoutSize)
+        PlayerBridge.setConfigBool(section: "Input", key: "TouchUI", value: config.touchUI)
+
+        PlayerBridge.setFont1(config.font1Name ?? "")
+        PlayerBridge.setFont2(config.font2Name ?? "")
+        PlayerBridge.setConfigString(section: "Player", key: "Font1", value: config.font1Name ?? "")
+        PlayerBridge.setConfigString(section: "Player", key: "Font2", value: config.font2Name ?? "")
+        PlayerBridge.setFont1Size(config.font1Size)
+        PlayerBridge.setFont2Size(config.font2Size)
+        PlayerBridge.setConfigInt(section: "Player", key: "Font1Size", value: config.font1Size)
+        PlayerBridge.setConfigInt(section: "Player", key: "Font2Size", value: config.font2Size)
+        PlayerBridge.setConfigBool(section: "Player", key: "PreferExternalFonts", value: config.preferExternalFonts)
+        PlayerBridge.setFastForwardSpeedA(config.fastForwardMultiplier)
+        PlayerBridge.setFastForwardSpeedB(config.fastForwardMultiplierB)
+        PlayerBridge.setConfigInt(section: "Input", key: "FastForwardMultiplier", value: config.fastForwardMultiplier)
+        PlayerBridge.setConfigInt(section: "Input", key: "FastForwardMultiplierB", value: config.fastForwardMultiplierB)
+        PlayerBridge.setConfigInt(section: "Input", key: "SpeedModifierA", value: config.fastForwardMultiplier)
+        PlayerBridge.setConfigInt(section: "Input", key: "SpeedModifierB", value: config.fastForwardMultiplierB)
+        PlayerBridge.setSettingsInMenu(config.settingsInMenu)
+        PlayerBridge.setConfigBool(section: "Player", key: "SettingsAutosave", value: config.settingsAutosave)
+        PlayerBridge.setConfigBool(section: "Player", key: "SettingsInMenu", value: config.settingsInMenu)
+        PlayerBridge.setLanguageSelectOnStart(config.languageSelectOnStart)
+        PlayerBridge.setConfigInt(section: "Player", key: "LanguageSelectOnStart", value: config.languageSelectOnStart)
+        PlayerBridge.setConfigBool(section: "Player", key: "SettingsInTitle", value: config.settingsInTitle)
+        PlayerBridge.setConfigBool(section: "Player", key: "LanguageInTitle", value: config.languageInTitle)
+        PlayerBridge.setConfigBool(section: "Player", key: "Logging", value: config.loggingEnabled)
+        PlayerBridge.setConfigBool(section: "Player", key: "ScreenshotTimestamp", value: config.screenshotTimestamp)
+        PlayerBridge.setConfigBool(section: "Player", key: "AutomaticScreenshots", value: config.automaticScreenshots)
+        PlayerBridge.setConfigInt(section: "Player", key: "ScreenshotScale", value: config.screenshotScale)
+        PlayerBridge.setConfigInt(section: "Player", key: "AutomaticScreenshotsInterval", value: config.automaticScreenshotsInterval)
+        PlayerBridge.setConfigInt(section: "Player", key: "StartupLogos", value: config.startupLogos)
+        PlayerBridge.setConfigInt(section: "Player", key: "GameBrowserLabelMode", value: config.gameBrowserLabelMode)
+        PlayerBridge.setConfigBool(section: "Player", key: "EnableRtpScanning", value: config.enableRtpScanning)
+        PlayerBridge.setConfigBool(section: "Player", key: "HasCompletedOnboarding", value: config.hasCompletedOnboarding)
+        if let easyRPGFolder = config.easyRPGFolderURL {
+            PlayerBridge.setConfigString(section: "Player", key: "EasyRPGFolder", value: pathForLaunch(fromAbsolutePath: easyRPGFolder.path))
+        } else {
+            PlayerBridge.setConfigString(section: "Player", key: "EasyRPGFolder", value: "")
+        }
+        if let rtpFolder = config.rtpFolderURL {
+            PlayerBridge.setConfigString(section: "Player", key: "RTPFolder", value: pathForLaunch(fromAbsolutePath: rtpFolder.path))
+        } else {
+            PlayerBridge.setConfigString(section: "Player", key: "RTPFolder", value: "")
+        }
+        applyVirtualLayoutToPlayer()
+    }
+
+    private func applyVirtualLayoutToPlayer() {
+        AppLogger.log("ENTER applyVirtualLayoutToPlayer")
+        IOSInputCoordinator.applyVirtualLayout(layoutStore: layoutStore, viewport: runtimeViewport)
+    }
+
+    private func handleDirectionInput(direction: String, isPressed: Bool) {
+        AppLogger.log("ENTER handleDirectionInput")
+        if isPressed {
+            PlayerBridge.sendKeyDown(direction)
+        } else {
+            PlayerBridge.sendKeyUp(direction)
+        }
+    }
+
+    private func handleButtonInput(buttonId: String, isPressed: Bool) {
+        AppLogger.log("ENTER handleButtonInput")
+        IOSInputCoordinator.sendButton(buttonId: buttonId, isPressed: isPressed, showMenu: { showMenu = true }, config: config, fastForwardAToggleActive: &fastForwardAToggleActive)
+    }
+}
+
+struct PlayerMenuSheet: View {
+    let game: Game
+    let onEditLayout: () -> Void
+    let onEditButtonMapping: () -> Void
+    let onOpenSettings: () -> Void
+    let onReset: () -> Void
+    let onEnd: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section(header: Text("ゲーム情報")) {
+                    HStack {
+                        Text("タイトル")
+                        Spacer()
+                        Text(game.title).font(.caption).foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("フォルダ")
+                        Spacer()
+                        Text(game.gameFolderName).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                Section(header: Text("操作")) {
+                    Button(action: { dismiss(); onEditLayout() }) {
+                        HStack {
+                            Image(systemName: "square.grid.2x2.fill")
+                            Text("レイアウトエディター")
+                        }
+                    }
+                    Button(action: { dismiss(); onEditButtonMapping() }) {
+                        HStack {
+                            Image(systemName: "gamecontroller.fill")
+                            Text("ボタン設定")
+                        }
+                    }
+                }
+
+                Section(header: Text("設定")) {
+                    Button(action: {
+                        dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { onOpenSettings() }
+                    }) {
+                        HStack {
+                            Image(systemName: "gearshape.fill")
+                            Text("設定を開く")
+                        }
+                    }
+                }
+
+                Section(header: Text("ゲーム操作")) {
+                    Button("FPS表示を切り替え") {
+                        PlayerBridge.toggleFps()
+                        dismiss()
+                    }
+                    Button("ゲームをリセット", role: .destructive) {
+                        dismiss()
+                        onReset()
+                    }
+                    Button("ゲームを終了", role: .destructive) {
+                        dismiss()
+                        onEnd()
+                    }
+                }
+            }
+            .navigationTitle("メニュー")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("閉じる") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+#Preview {
+    PlayerView(game: Game(
+        title: "Test Game",
+        path: "/path/to/game",
+        savePath: "/path/to/saves"
+    ))
+}

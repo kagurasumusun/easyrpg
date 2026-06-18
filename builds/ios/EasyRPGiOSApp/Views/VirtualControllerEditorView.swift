@@ -1,0 +1,406 @@
+import SwiftUI
+import UniformTypeIdentifiers
+import UIKit
+import Darwin
+
+struct VirtualControllerEditorView: View {
+    struct DevicePreset: Identifiable, Hashable {
+        let id: String
+        let name: String
+        let points: CGSize
+        let hasNotch: Bool
+
+        var aspectRatio: CGFloat { points.width / points.height }
+    }
+
+    private static let devicePresets: [DevicePreset] = [
+        .init(id: "iphone_se_3", name: "iPhone SE (3rd)", points: CGSize(width: 375, height: 667), hasNotch: false),
+        .init(id: "iphone_12_mini", name: "iPhone 12 mini", points: CGSize(width: 360, height: 780), hasNotch: true),
+        .init(id: "iphone_12_12_pro", name: "iPhone 12 / 12 Pro", points: CGSize(width: 390, height: 844), hasNotch: true),
+        .init(id: "iphone_13_14", name: "iPhone 13/14", points: CGSize(width: 390, height: 844), hasNotch: true),
+        .init(id: "iphone_14_pro", name: "iPhone 14 Pro", points: CGSize(width: 393, height: 852), hasNotch: true),
+        .init(id: "iphone_14_pro_max", name: "iPhone 14 Pro Max", points: CGSize(width: 430, height: 932), hasNotch: true),
+        .init(id: "iphone_15_16", name: "iPhone 15/16", points: CGSize(width: 393, height: 852), hasNotch: true),
+        .init(id: "iphone_15_16_plus", name: "iPhone 15/16 Plus", points: CGSize(width: 430, height: 932), hasNotch: true)
+    ]
+
+    private static let modelMap: [String: String] = [
+        "iPhone14,6": "iphone_se_3",
+        "iPhone13,1": "iphone_12_mini",
+        "iPhone13,2": "iphone_12_12_pro",
+        "iPhone14,5": "iphone_13_14", "iPhone14,7": "iphone_13_14", "iPhone14,8": "iphone_13_14",
+        "iPhone15,2": "iphone_14_pro", "iPhone15,3": "iphone_14_pro_max",
+        "iPhone15,4": "iphone_15_16", "iPhone15,5": "iphone_15_16_plus",
+        "iPhone16,1": "iphone_15_16", "iPhone16,2": "iphone_15_16_plus",
+        "iPhone17,1": "iphone_15_16", "iPhone17,2": "iphone_15_16_plus"
+    ]
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var store = VirtualControllerLayoutStore.shared
+    @State private var workingButtons: [VirtualButtonLayout] = []
+    @State private var selectedButtonInstanceId: String?
+    @State private var showMenu = false
+    @State private var showAddMenu = false
+    @State private var isLandscapeEditing = false
+    @State private var exportURL: URL?
+    @State private var showExporter = false
+    @State private var showImporter = false
+    @State private var autoDetectedPresetId: String = Self.detectCurrentDevicePreset().id
+    @ObservedObject private var config = ConfigManager.shared
+
+    private var selectedButton: VirtualButtonLayout? {
+        guard let selectedButtonInstanceId else { return nil }
+        return workingButtons.first(where: { $0.instanceId == selectedButtonInstanceId })
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.9).ignoresSafeArea()
+
+            VStack(spacing: 8) {
+                DeviceFrameEditorCanvas(
+                    preset: activePreset,
+                    workingButtons: $workingButtons,
+                    selectedButtonInstanceId: $selectedButtonInstanceId
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 6)
+        }
+        .navigationTitle("レイアウト編集")
+        .navigationBarTitleDisplayMode(.inline)
+        .background(Color.black.ignoresSafeArea())
+        .onAppear {
+            autoDetectedPresetId = Self.detectCurrentDevicePreset().id
+            loadWorkingButtons()
+        }
+        .onChange(of: isLandscapeEditing) { _, _ in loadWorkingButtons() }
+        .overlay {
+            if showMenu { editorMenuOverlay }
+        }
+        .overlay {
+            if showAddMenu { addButtonOverlay }
+        }
+        .toolbar(content: toolbarContent)
+        .fileExporter(isPresented: $showExporter, document: exportDocument(), contentType: .json, defaultFilename: exportURL?.lastPathComponent ?? "layout.json") { _ in }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.json]) { result in
+            if case .success(let url) = result {
+                _ = store.importProfile(from: url)
+                loadWorkingButtons()
+            }
+        }
+    }
+
+    private func loadWorkingButtons() {
+        workingButtons = store.buttons(isLandscape: isLandscapeEditing)
+    }
+
+    private var activePreset: DevicePreset {
+        Self.devicePresets.first(where: { $0.id == autoDetectedPresetId }) ?? Self.devicePresets[0]
+    }
+
+    private static func detectCurrentDevicePreset() -> DevicePreset {
+        let model = deviceModelIdentifier()
+        if let pid = modelMap[model], let preset = devicePresets.first(where: { $0.id == pid }) {
+            return preset
+        }
+        let bounds = UIScreen.main.bounds
+        let portraitSize = CGSize(width: min(bounds.width, bounds.height), height: max(bounds.width, bounds.height))
+        return devicePresets.min(by: {
+            let lhsDelta = abs($0.points.width - portraitSize.width) + abs($0.points.height - portraitSize.height)
+            let rhsDelta = abs($1.points.width - portraitSize.width) + abs($1.points.height - portraitSize.height)
+            return lhsDelta < rhsDelta
+        }) ?? devicePresets[0]
+    }
+
+    private static func deviceModelIdentifier() -> String {
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        return withUnsafePointer(to: &systemInfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) { ptr in
+                String(cString: ptr)
+            }
+        }
+    }
+
+    private var editorMenuOverlay: some View {
+        ZStack(alignment: .bottom) {
+            Color.black.opacity(0.55).ignoresSafeArea().onTapGesture { showMenu = false }
+
+            VStack(spacing: 0) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.4))
+                    .frame(width: 44, height: 5)
+                    .padding(.top, 10)
+                    .padding(.bottom, 8)
+
+                ScrollView {
+                    VStack(spacing: 0) {
+                    menuRow(isLandscapeEditing ? "縦向きを編集" : "横向きを編集") { isLandscapeEditing.toggle() }
+                    menuRow(config.ignoreLayoutSize ? "自動サイズON" : "自動サイズOFF") { config.ignoreLayoutSize.toggle(); config.saveSettings() }
+                    menuRow("全ボタンを少し大きく") { adjustAllButtons(by: 5) }
+                    menuRow("全ボタンを少し小さく") { adjustAllButtons(by: -5) }
+                    menuRow("ボタンを追加") { showAddMenu = true }
+                    menuRow("この向きをデフォルトにリセット") { workingButtons = VirtualButtonLayout.default; saveLayout() }
+                    if selectedButton != nil {
+                        menuRow("選択中ボタンを削除", destructive: true) {
+                            guard let id = selectedButtonInstanceId else { return }
+                            workingButtons.removeAll { $0.instanceId == id }
+                            selectedButtonInstanceId = nil
+                            saveLayout()
+                        }
+                    }
+                    menuRow("レイアウトを新規作成") { store.addProfile(name: "Layout \(store.profiles.count + 1)"); loadWorkingButtons() }
+                    menuRow("エクスポート") { exportURL = store.exportActiveProfile(); showExporter = exportURL != nil }
+                    menuRow("インポート") { showImporter = true }
+                    menuRow("保存して閉じる") { saveLayout(); dismiss() }
+                    menuRow("保存せず閉じる", destructive: true) { dismiss() }
+                    menuRow("閉じる") { showMenu = false }
+                    }
+                }
+                .frame(maxHeight: 420)
+            }
+            .background(Color(UIColor.systemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    private var addButtonOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.45).ignoresSafeArea().onTapGesture { showAddMenu = false }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("追加するボタン").font(.headline)
+                    ForEach(VirtualControllerLayoutStore.addableButtons, id: \.instanceId) { item in
+                        menuRow("\(item.title) (\(item.id))") {
+                            var copy = item
+                            copy.instanceId = UUID().uuidString
+                            workingButtons.append(copy)
+                            showAddMenu = false
+                        }
+                    }
+                }
+                .padding(16)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .padding(20)
+            }
+        }
+    }
+
+    private func adjustAllButtons(by delta: Int) {
+        workingButtons = workingButtons.map { b in
+            var m = b
+            m.size = min(180, max(50, m.size + delta))
+            return m
+        }
+    }
+
+    private func menuRow(_ title: String, destructive: Bool = false, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 10)
+                .padding(.horizontal, 12)
+                .overlay(alignment: .bottom) { Divider().opacity(0.35) }
+                .foregroundStyle(destructive ? Color.red : Color.primary)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private func toolbarContent() -> some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Button { showMenu = true } label: { Label("メニュー", systemImage: "line.3.horizontal") }
+        }
+    }
+
+    private func saveLayout() {
+        store.updateButtons(workingButtons, isLandscape: isLandscapeEditing)
+    }
+
+    private func exportDocument() -> LayoutExportDocument {
+        let data = (exportURL.flatMap { try? Data(contentsOf: $0) }) ?? Data()
+        return LayoutExportDocument(data: data)
+    }
+}
+
+private struct EditorButtonView: View {
+    @Binding var button: VirtualButtonLayout
+    @Binding var selectedButtonInstanceId: String?
+    let canvasSize: CGSize
+    @ObservedObject private var config = ConfigManager.shared
+    @State private var dragAnchor: CGPoint?
+
+    private var editorButtonSize: CGFloat {
+        VirtualControllerView.visualSize(for: button, config: config, viewport: .zero)
+    }
+
+    var body: some View {
+        VirtualButtonView(button: button, isPressed: false, opacity: max(0.0, min(1.0, Double(255 - config.layoutTransparency) / 255.0)), size: editorButtonSize, config: config)
+            .overlay(
+                Circle().stroke(selectedButtonInstanceId == button.instanceId ? Color.yellow : .clear, lineWidth: 2)
+            )
+            .position(x: button.x * canvasSize.width, y: button.y * canvasSize.height)
+            .onTapGesture { selectedButtonInstanceId = button.instanceId }
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                    selectedButtonInstanceId = button.instanceId
+                    if dragAnchor == nil {
+                        dragAnchor = CGPoint(x: button.x * canvasSize.width, y: button.y * canvasSize.height)
+                    }
+                    guard let dragAnchor else { return }
+                    let translatedPoint = CGPoint(
+                        x: dragAnchor.x + value.translation.width,
+                        y: dragAnchor.y + value.translation.height
+                    )
+                    button.x = min(max(0.0, translatedPoint.x / canvasSize.width), 1.0)
+                    button.y = min(max(0.0, translatedPoint.y / canvasSize.height), 1.0)
+                }
+                .onEnded { _ in dragAnchor = nil }
+            )
+    }
+}
+
+
+private struct EditorDPadView: View {
+    @Binding var workingButtons: [VirtualButtonLayout]
+    let canvasSize: CGSize
+
+    @ObservedObject private var config = ConfigManager.shared
+    @State private var dragStart: [String: CGPoint] = [:]
+
+    private var directionalIndexes: [Int] {
+        workingButtons.indices.filter { ["up", "down", "left", "right"].contains(workingButtons[$0].id) }
+    }
+
+    private var center: CGPoint {
+        guard !directionalIndexes.isEmpty else { return .zero }
+        let xs = directionalIndexes.map { workingButtons[$0].x }
+        let ys = directionalIndexes.map { workingButtons[$0].y }
+        return CGPoint(x: xs.reduce(0, +) / CGFloat(xs.count), y: ys.reduce(0, +) / CGFloat(ys.count))
+    }
+
+    private var dpadSize: CGFloat {
+        let sizes = directionalIndexes.map { VirtualControllerView.visualSize(for: workingButtons[$0], config: config, viewport: .zero) }
+        let maxSize = sizes.max() ?? 64
+        return maxSize * 2.2
+    }
+
+    var body: some View {
+        if directionalIndexes.count == 4 {
+            AndroidDPadShape()
+                .stroke(Color.white.opacity(max(0.0, min(1.0, Double(255 - config.layoutTransparency) / 255.0))), style: StrokeStyle(lineWidth: 3, lineCap: .butt, lineJoin: .miter, miterLimit: 10))
+                .frame(width: dpadSize, height: dpadSize)
+                .position(x: center.x * canvasSize.width, y: center.y * canvasSize.height)
+                .highPriorityGesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            if dragStart.isEmpty {
+                                for idx in directionalIndexes {
+                                    dragStart[workingButtons[idx].instanceId] = CGPoint(x: workingButtons[idx].x, y: workingButtons[idx].y)
+                                }
+                            }
+                            let dx = value.translation.width / max(canvasSize.width, 1)
+                            let dy = value.translation.height / max(canvasSize.height, 1)
+                            for idx in directionalIndexes {
+                                guard let base = dragStart[workingButtons[idx].instanceId] else { continue }
+                                workingButtons[idx].x = min(max(0.0, base.x + dx), 1.0)
+                                workingButtons[idx].y = min(max(0.0, base.y + dy), 1.0)
+                            }
+                        }
+                        .onEnded { _ in
+                            dragStart.removeAll()
+                        }
+                )
+        }
+    }
+}
+
+private struct AndroidDPadShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let s = min(rect.width, rect.height)
+        let oneThird = floor(s * 0.33)
+        let twoThird = oneThird * 2
+        let border: CGFloat = 5
+        let minX = rect.minX + border
+        let minY = rect.minY + border
+        let maxX = rect.maxX - border
+        let maxY = rect.maxY - border
+
+        var p = Path()
+        p.move(to: CGPoint(x: rect.minX + oneThird, y: minY))
+        p.addLine(to: CGPoint(x: rect.minX + twoThird, y: minY))
+        p.addLine(to: CGPoint(x: rect.minX + twoThird, y: rect.minY + oneThird))
+        p.addLine(to: CGPoint(x: maxX, y: rect.minY + oneThird))
+        p.addLine(to: CGPoint(x: maxX, y: rect.minY + twoThird))
+        p.addLine(to: CGPoint(x: rect.minX + twoThird, y: rect.minY + twoThird))
+        p.addLine(to: CGPoint(x: rect.minX + twoThird, y: maxY))
+        p.addLine(to: CGPoint(x: rect.minX + oneThird, y: maxY))
+        p.addLine(to: CGPoint(x: rect.minX + oneThird, y: rect.minY + twoThird))
+        p.addLine(to: CGPoint(x: minX, y: rect.minY + twoThird))
+        p.addLine(to: CGPoint(x: minX, y: rect.minY + oneThird))
+        p.addLine(to: CGPoint(x: rect.minX + oneThird, y: rect.minY + oneThird))
+        p.closeSubpath()
+        return p
+    }
+}
+
+private struct DeviceFrameEditorCanvas: View {
+    let preset: VirtualControllerEditorView.DevicePreset
+    @Binding var workingButtons: [VirtualButtonLayout]
+    @Binding var selectedButtonInstanceId: String?
+
+    var body: some View {
+        GeometryReader { outerGeo in
+            let frameWidth = min(outerGeo.size.width, outerGeo.size.height * preset.aspectRatio)
+            let frameHeight = frameWidth / preset.aspectRatio
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 34, style: .continuous)
+                    .fill(Color(white: 0.12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 34, style: .continuous)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+
+                VStack {
+                    if preset.hasNotch {
+                        Capsule()
+                            .fill(Color.black.opacity(0.95))
+                            .frame(width: frameWidth * 0.36, height: 26)
+                            .padding(.top, 10)
+                    }
+                    Spacer()
+                }
+
+                ZStack {
+                    Color.black
+                    EditorDPadView(workingButtons: $workingButtons, canvasSize: CGSize(width: frameWidth - 28, height: frameHeight - 28))
+                    ForEach($workingButtons, id: \.instanceId) { $button in
+                        if !["up", "down", "left", "right"].contains(button.id) {
+                            EditorButtonView(button: $button, selectedButtonInstanceId: $selectedButtonInstanceId, canvasSize: CGSize(width: frameWidth - 28, height: frameHeight - 28))
+                        }
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .padding(14)
+            }
+            .frame(width: frameWidth, height: frameHeight)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity)
+        .aspectRatio(preset.aspectRatio, contentMode: .fit)
+    }
+}
+
+private struct LayoutExportDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+    var data: Data
+    init(data: Data) { self.data = data }
+    init(configuration: ReadConfiguration) throws { self.data = configuration.file.regularFileContents ?? Data() }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { .init(regularFileWithContents: data) }
+}

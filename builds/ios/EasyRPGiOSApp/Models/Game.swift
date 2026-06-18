@@ -1,0 +1,272 @@
+import Foundation
+import UIKit
+
+private struct EasyRPGManifest: Decodable {
+    let title: String?
+    let author: String?
+}
+
+enum ProjectType: Int {
+    case unknown = 0
+    case supported = 1
+    case unsupported = 2
+}
+
+struct Game: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let displayTitle: String
+    let path: String
+    let savePath: String
+    let gameFolderName: String
+    let author: String
+    var favorite: Bool
+    var projectType: ProjectType
+    var customTitle: String?
+    var titleImage: UIImage?
+    var encoding: String
+
+    init(
+        title: String,
+        displayTitle: String = "",
+        path: String,
+        savePath: String = "",
+        gameFolderName: String = "",
+        author: String = "Unknown",
+        favorite: Bool = false,
+        projectType: ProjectType = .supported,
+        customTitle: String? = nil,
+        titleImage: UIImage? = nil,
+        encoding: String = "auto"
+    ) {
+        self.id = path
+        self.title = title
+        self.displayTitle = displayTitle.isEmpty ? title : displayTitle
+        self.path = path
+        self.savePath = savePath
+        self.gameFolderName = gameFolderName
+        self.author = author
+        self.favorite = favorite
+        self.projectType = projectType
+        self.customTitle = customTitle
+        self.titleImage = titleImage
+        self.encoding = encoding
+    }
+
+    func getDisplayTitle(labelMode: Int) -> String {
+        if let customTitle = customTitle, !customTitle.isEmpty {
+            return customTitle
+        }
+        if labelMode == 0 && !title.isEmpty {
+            return title
+        }
+        return gameFolderName
+    }
+}
+
+enum AppScreen: Hashable {
+    case initScreen
+    case browser
+    case player(Game)
+    case settings
+}
+
+@MainActor
+final class GameLibrary: ObservableObject {
+    @Published private(set) var games: [Game] = []
+    @Published var isScanning = false
+
+    private let configManager = ConfigManager.shared
+    private let favoritesKey = "ios.favoriteGames"
+
+    func reloadGames(forceScan: Bool = false) {
+        AppLogger.log("ENTER reloadGames")
+        AppLogger.log("reloadGames forceScan=\(forceScan)")
+        isScanning = true
+
+        let easyRPGFolder = configManager.easyRPGFolderURL
+        let labelMode = configManager.gameBrowserLabelMode
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, easyRPGFolder, labelMode] in
+            guard let self = self else { return }
+            let fileManager = FileManager.default
+
+            var found: [Game] = []
+            let favoritePaths = Self.loadFavoritePaths(favoritesKey: self.favoritesKey)
+
+            if let folder = easyRPGFolder {
+                let discovered = Self.discoverGames(in: folder, fileManager: fileManager)
+                found.append(contentsOf: discovered.map { base in
+                    Self.loadGameMetadata(at: base, isFavorite: favoritePaths.contains(base.path), fileManager: fileManager)
+                })
+            }
+
+            let unique = Dictionary(grouping: found, by: { $0.path }).compactMap { $0.value.first }
+            let sorted = unique.sorted { game1, game2 in
+                // Favorites first
+                if game1.favorite != game2.favorite {
+                    return game1.favorite
+                }
+                // Unsupported games last
+                if game1.projectType != game2.projectType {
+                    if game1.projectType == .supported {
+                        return true
+                    }
+                    return false
+                }
+                return game1.getDisplayTitle(labelMode: labelMode)
+                    .localizedCaseInsensitiveCompare(game2.getDisplayTitle(labelMode: labelMode)) == .orderedAscending
+            }
+
+            DispatchQueue.main.async {
+                let withCustomTitles = sorted.map { game in
+                    var copy = game
+                    copy.customTitle = self.configManager.getCustomGameTitle(for: game.path)
+                    return copy
+                }
+                self.games = withCustomTitles
+                self.isScanning = false
+            }
+        }
+    }
+
+    func toggleFavorite(_ game: Game) {
+        AppLogger.log("ENTER toggleFavorite")
+        var updated = Self.loadFavoritePaths(favoritesKey: favoritesKey)
+        if updated.contains(game.path) {
+            updated.remove(game.path)
+        } else {
+            updated.insert(game.path)
+        }
+        UserDefaults.standard.set(Array(updated), forKey: favoritesKey)
+        reloadGames()
+    }
+
+    func setCustomTitle(_ title: String, for game: Game) {
+        AppLogger.log("ENTER setCustomTitle")
+        configManager.setCustomGameTitle(title, for: game.id)
+        reloadGames()
+    }
+
+    nonisolated private static func loadGameMetadata(at url: URL, isFavorite: Bool, fileManager: FileManager) -> Game {
+        AppLogger.log("ENTER loadGameMetadata")
+        let folderName = url.lastPathComponent
+        var title = folderName
+        var savePath = ""
+        let projectType = ProjectType.supported
+        var encoding = "auto"
+        var author = "Unknown"
+        var titleImage: UIImage? = nil
+
+        if let manifestPath = findFile(in: url, named: "easyrpg-player-manifest.json", fileManager: fileManager),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: manifestPath)),
+           let manifest = try? JSONDecoder().decode(EasyRPGManifest.self, from: data) {
+            if let manifestTitle = manifest.title, !manifestTitle.isEmpty {
+                title = manifestTitle
+            }
+            if let manifestAuthor = manifest.author, !manifestAuthor.isEmpty {
+                author = manifestAuthor
+            }
+        }
+
+        // Load from RPG_RT.ini
+        if let iniPath = findFile(in: url, named: "RPG_RT.ini", fileManager: fileManager),
+           let iniContent = try? String(contentsOfFile: iniPath, encoding: .utf8) {
+            title = parseIniValue(iniContent, key: "Title") ?? title
+            savePath = parseIniValue(iniContent, key: "SavePath") ?? ""
+            encoding = parseIniValue(iniContent, key: "Encoding") ?? "auto"
+            author = parseIniValue(iniContent, key: "Author") ?? author
+        }
+
+        titleImage = loadTitleImage(in: url, fileManager: fileManager)
+
+        return Game(
+            title: title,
+            path: url.path,
+            savePath: savePath,
+            gameFolderName: folderName,
+            author: author,
+            favorite: isFavorite,
+            projectType: projectType,
+            titleImage: titleImage,
+            encoding: encoding
+        )
+    }
+
+    nonisolated private static func loadFavoritePaths(favoritesKey: String) -> Set<String> {
+        AppLogger.log("ENTER loadFavoritePaths")
+        return Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
+    }
+
+    nonisolated private static func discoverGames(in root: URL, fileManager: FileManager) -> [URL] {
+        AppLogger.log("ENTER discoverGames")
+        var matches: [URL] = []
+        
+        if let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles],
+            errorHandler: nil
+        ) {
+            for case let url as URL in enumerator {
+                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                guard isDir else { continue }
+                if containsRpgMarkerFiles(in: url, fileManager: fileManager) {
+                    matches.append(url)
+                    enumerator.skipDescendants()
+                }
+            }
+        }
+        
+        return matches
+    }
+
+    nonisolated private static func containsRpgMarkerFiles(in directory: URL, fileManager: FileManager) -> Bool {
+        AppLogger.log("ENTER containsRpgMarkerFiles")
+        let candidates = ["RPG_RT.ldb", "RPG_RT.lmt", "RPG_RT.ini", "easyrpg-player-manifest.json"]
+        return candidates.contains(where: { fileManager.fileExists(atPath: directory.appendingPathComponent($0).path) })
+    }
+
+    nonisolated private static func findFile(in directory: URL, named: String, fileManager: FileManager) -> String? {
+        AppLogger.log("ENTER findFile")
+        let path = directory.appendingPathComponent(named).path
+        if fileManager.fileExists(atPath: path) {
+            return path
+        }
+        return nil
+    }
+
+    nonisolated private static func loadTitleImage(in directory: URL, fileManager: FileManager) -> UIImage? {
+        let titleDir = directory.appendingPathComponent("Title")
+        let exts = ["png", "bmp", "xyz", "jpg", "jpeg", "webp"]
+
+        for ext in exts {
+            let path = titleDir.appendingPathComponent("Title.\(ext)").path
+            if fileManager.fileExists(atPath: path), let img = UIImage(contentsOfFile: path) {
+                return img
+            }
+        }
+
+        if let files = try? fileManager.contentsOfDirectory(at: titleDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for file in files {
+                if let img = UIImage(contentsOfFile: file.path) {
+                    return img
+                }
+            }
+        }
+
+        return nil
+    }
+
+    nonisolated private static func parseIniValue(_ content: String, key: String) -> String? {
+        AppLogger.log("ENTER parseIniValue")
+        let lines = content.components(separatedBy: .newlines)
+        for line in lines {
+            if line.starts(with: key + "=") {
+                let value = String(line.dropFirst(key.count + 1)).trimmingCharacters(in: .whitespaces)
+                return value.isEmpty ? nil : value
+            }
+        }
+        return nil
+    }
+}
